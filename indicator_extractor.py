@@ -21,10 +21,10 @@ Results are written to both indicator_inventory.csv and indicator_inventory.xlsx
 
 Usage
 -----
-    python kenada_indicator_extractor.py
-    python kenada_indicator_extractor.py --input "Reports_and_Datasets_from_Kenada_and_Website.xlsx"
-    python kenada_indicator_extractor.py --limit 20          # quick test run
-    python kenada_indicator_extractor.py --workers 4         # parallel downloads
+    python indicator_extractor.py
+    python indicator_extractor.py --input "knbs_scraped_reports.xlsx"
+    python indicator_extractor.py --limit 20          # quick test run
+    python indicator_extractor.py --workers 4         # parallel downloads
 
 Dependencies
 ------------
@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -65,8 +66,8 @@ import pdfplumber
 # Configuration
 # --------------------------------------------------------------------------- #
 
-DEFAULT_INPUT_XLSX = "Reports_and_Datasets_from_Kenada_and_Website.xlsx"
-SHEET_NAME = "Datasets"
+DEFAULT_INPUT_XLSX = "knbs_scraped_reports.xlsx"
+SHEET_NAME = "KNBS_Reports"
 DOWNLOAD_DIR = Path("./downloaded_reports")
 LOG_DIR = Path("./logs")
 OUTPUT_CSV = "indicator_inventory.csv"
@@ -89,6 +90,84 @@ REQUEST_TIMEOUT = 30          # seconds
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2.0           # seconds, multiplied by attempt number
 TOC_SEARCH_PAGES = 15         # how many leading pages to scan for a TOC
+
+# knbs.or.ke serves TLS certs signed by Let's Encrypt's short-lived "YE2"
+# intermediate but doesn't include that intermediate (or the cross-signed
+# root it chains to) in the handshake itself - a server misconfiguration.
+# Browsers paper over this with automatic AIA chasing, but Python's
+# requests/urllib3 don't, so every request silently fails TLS verification
+# unless the OS trust store has independently cached these certs. The chain
+# is: knbs.or.ke leaf -> "YE2" intermediate -> "ISRG Root YE" (cross-signed
+# by "ISRG Root X2", which certifi already trusts). We bundle the two
+# missing links here and merge them with certifi's CA bundle at startup so
+# requests always has a complete chain to validate against.
+_LETSENCRYPT_YE2_INTERMEDIATE_PEM = """\
+-----BEGIN CERTIFICATE-----
+MIICjDCCAhGgAwIBAgIQTfOxXdbAeExQfNN7WObxFTAKBggqhkjOPQQDAzAuMQsw
+CQYDVQQGEwJVUzENMAsGA1UEChMESVNSRzEQMA4GA1UEAxMHUm9vdCBZRTAeFw0y
+NTA5MDMwMDAwMDBaFw0yODA5MDIyMzU5NTlaMDMxCzAJBgNVBAYTAlVTMRYwFAYD
+VQQKEw1MZXQncyBFbmNyeXB0MQwwCgYDVQQDEwNZRTIwdjAQBgcqhkjOPQIBBgUr
+gQQAIgNiAARxmrQzkdbEEL3MqXt3dJQttYc47axkdDTHud5TPqM2z5uSD5cmk0Wr
+HlWXvnlvqBLqiB34kluxIbmMyAiq3/YD6e80/vV259K8XQIdjFXloYOa0mIU71f7
+HQ09PvYDlw+jge4wgeswDgYDVR0PAQH/BAQDAgGGMBMGA1UdJQQMMAoGCCsGAQUF
+BwMBMBIGA1UdEwEB/wQIMAYBAf8CAQAwHQYDVR0OBBYEFLlZ8o7PIvCG0zdI/3YU
+GLqC2FWHMB8GA1UdIwQYMBaAFKPIJlqOoUzQNWP8myPIOq5W809WMDIGCCsGAQUF
+BwEBBCYwJDAiBggrBgEFBQcwAoYWaHR0cDovL3llLmkubGVuY3Iub3JnLzATBgNV
+HSAEDDAKMAgGBmeBDAECATAnBgNVHR8EIDAeMBygGqAYhhZodHRwOi8veWUuYy5s
+ZW5jci5vcmcvMAoGCCqGSM49BAMDA2kAMGYCMQDIcnw5dcZLN9ffynXnnkLD/itS
+JEycJPb3sRkzeqBowup7vOsAwaqoCnNn/jh9wycCMQCJM6CPlaOC4pQYYbJtVPYb
+DKrIb2EKk5NpOpE6/XttQYZV/3gilB9l+Cc/DOVwmyg=
+-----END CERTIFICATE-----
+"""
+
+_ISRG_ROOT_YE_CROSS_SIGNED_PEM = """\
+-----BEGIN CERTIFICATE-----
+MIICpjCCAiugAwIBAgIRAIchZfw0tuX7qK3Vs3BftTowCgYIKoZIzj0EAwMwTzEL
+MAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2VhcmNo
+IEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDIwHhcNMjYwNTEzMDAwMDAwWhcN
+MzIwOTAyMjM1OTU5WjAuMQswCQYDVQQGEwJVUzENMAsGA1UEChMESVNSRzEQMA4G
+A1UEAxMHUm9vdCBZRTB2MBAGByqGSM49AgEGBSuBBAAiA2IABDwS/6vhrcVqcbBo
++wgdI3fwn9x7DNJJOY/lTOti0vkwuRN87RhEhTH17E7XyFjWsPYhIPt/wzOqxTd2
+b+4ZJNy9ID04YywF9U5zasDVyGSNErVNtz8uSGh5izW87j77GaOB6zCB6DAOBgNV
+HQ8BAf8EBAMCAQYwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDwYDVR0TAQH/BAUwAwEB
+/zAdBgNVHQ4EFgQUo8gmWo6hTNA1Y/ybI8g6rlbzT1YwHwYDVR0jBBgwFoAUfEKW
+rt5LSDv6kviejM9ti6lyN5UwMgYIKwYBBQUHAQEEJjAkMCIGCCsGAQUFBzAChhZo
+dHRwOi8veDIuaS5sZW5jci5vcmcvMBMGA1UdIAQMMAowCAYGZ4EMAQIBMCcGA1Ud
+HwQgMB4wHKAaoBiGFmh0dHA6Ly94Mi5jLmxlbmNyLm9yZy8wCgYIKoZIzj0EAwMD
+aQAwZgIxAMU19WCtmxVND8UHBZRoma49Z7jPs64Dma0eTu1OChVbB/2J7GV3nvYK
+Ax54uk1G9QIxAO0miLVJu8PLNiXXXkiE/gsK3CTRTF/aeo4bMX42Zw40csRU6AC2
+6hSW1/IWaas6dg==
+-----END CERTIFICATE-----
+"""
+
+
+def _build_ca_bundle() -> "str | bool":
+    """
+    Return a filesystem path to a CA bundle usable for `requests`'s `verify=`
+    argument: the default certifi bundle plus the two missing Let's Encrypt
+    chain certs above. Falls back to certifi's own bundle (or True, letting
+    requests pick its normal default) if anything goes wrong.
+    """
+    try:
+        import certifi
+        base_bundle = Path(certifi.where())
+    except ImportError:
+        return True  # no certifi available - use requests' built-in default
+
+    try:
+        merged = (
+            base_bundle.read_text()
+            + "\n" + _LETSENCRYPT_YE2_INTERMEDIATE_PEM
+            + "\n" + _ISRG_ROOT_YE_CROSS_SIGNED_PEM
+        )
+        tmp_path = Path(tempfile.gettempdir()) / "knbs_scraper_ca_bundle.pem"
+        tmp_path.write_text(merged)
+        return str(tmp_path)
+    except OSError:
+        return str(base_bundle)
+
+
+CA_BUNDLE = _build_ca_bundle()
 
 # Only rows whose Source column matches this (case-insensitive) are
 # downloaded - KeNADA rows are skipped entirely, per requirement.
@@ -271,6 +350,7 @@ def _get_with_retries(url: str, *, stream: bool = False) -> requests.Response:
                 timeout=REQUEST_TIMEOUT,
                 stream=stream,
                 allow_redirects=True,
+                verify=CA_BUNDLE,
             )
             if resp.status_code == 200:
                 return resp
@@ -327,6 +407,18 @@ def resolve_pdf_link(landing_url: str) -> Optional[str]:
                     return guess
             except requests.RequestException:
                 pass
+        # Diagnostics: log what we actually got back, so a run of failures
+        # can be told apart from "real page, no PDF link" vs "redirected to
+        # a 404/home page" vs "served almost no HTML at all".
+        try:
+            anchor_count = len(BeautifulSoup(resp.text, "html.parser").find_all("a"))
+        except Exception:
+            anchor_count = -1
+        logger.info(
+            f"[RESOLVE] No PDF link found on {landing_url} "
+            f"(final_url={resp.url}, status={resp.status_code}, "
+            f"html_len={len(resp.text)}, anchors={anchor_count})"
+        )
         return None
 
     return ranked[0][0]
@@ -362,7 +454,10 @@ def search_knbs_website(pub_name: str, year: str = "") -> list[str]:
         return []
 
     scored: dict[str, float] = {}
+    total_anchors = 0
+    onsite_anchors = 0
     for a in soup.find_all("a", href=True):
+        total_anchors += 1
         href = a["href"].strip()
         link_text = a.get_text(" ", strip=True)
         if not href or not link_text:
@@ -372,8 +467,19 @@ def search_knbs_website(pub_name: str, year: str = "") -> list[str]:
         parsed = urlparse(abs_url)
         if "knbs.or.ke" not in parsed.netloc:
             continue  # ignore off-site links (social icons, ads, nav, etc.)
-        if not (abs_url.lower().split("?")[0].endswith(".pdf") or "/reports/" in abs_url.lower()):
-            continue  # only consider report pages or direct PDF links
+        onsite_anchors += 1
+        path_l = abs_url.lower().split("?")[0]
+        # Accept direct PDFs, report/publication pages, and uploaded files -
+        # KNBS has used more than one URL scheme over time (/reports/,
+        # /publications/, /download/, wp-content/uploads/...).
+        if not (
+            path_l.endswith(".pdf")
+            or "/reports/" in path_l
+            or "/publications/" in path_l
+            or "/download" in path_l
+            or "wp-content/uploads" in path_l
+        ):
+            continue
 
         score = difflib.SequenceMatcher(None, link_text.lower(), pub_name.lower()).ratio()
         if year and (year in href or year in link_text):
@@ -382,7 +488,17 @@ def search_knbs_website(pub_name: str, year: str = "") -> list[str]:
         scored[abs_url] = max(scored.get(abs_url, 0.0), score)
 
     ranked = sorted(scored.items(), key=lambda kv: kv[1], reverse=True)
-    return [url for url, score in ranked if score >= SITE_SEARCH_MIN_SCORE][:SITE_SEARCH_MAX_CANDIDATES]
+    accepted = [url for url, score in ranked if score >= SITE_SEARCH_MIN_SCORE][:SITE_SEARCH_MAX_CANDIDATES]
+
+    if not accepted:
+        top = ", ".join(f"{u!r}={s:.2f}" for u, s in ranked[:3]) or "none"
+        logger.info(
+            f"[FALLBACK] KNBS search for '{pub_name}' returned {total_anchors} links "
+            f"({onsite_anchors} on-site); best candidates below threshold "
+            f"({SITE_SEARCH_MIN_SCORE}): {top}"
+        )
+
+    return accepted
 
 
 def resolve_via_site_search(pub_name: str, year: str = "") -> Optional[str]:
